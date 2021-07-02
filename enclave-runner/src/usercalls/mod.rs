@@ -19,6 +19,7 @@ use std::{cmp, fmt, str};
 
 use failure::{self, bail};
 use fnv::FnvHashMap;
+use futures::executor;
 use futures::future::{poll_fn, Either, Future, FutureExt};
 use futures::lock::Mutex;
 use futures::StreamExt;
@@ -649,7 +650,7 @@ pub(crate) struct EnclaveState {
     last_fd: AtomicUsize,
     exiting: AtomicBool,
     usercall_ext: Box<dyn UsercallExtension>,
-    threads_queue: crossbeam::queue::SegQueue<StoppedTcs>,
+    available_enclave_threads: Mutex<FnvHashMap<TcsAddress, StoppedTcs>>,
     forward_panics: bool,
     // Once set to Some, the guards should not be dropped for the lifetime of the enclave.
     fifo_guards: Mutex<Option<FifoGuards>>,
@@ -728,10 +729,10 @@ impl EnclaveState {
 
         let usercall_ext = usercall_ext.unwrap_or_else(|| Box::new(UsercallExtensionDefault));
 
-        let threads_queue = crossbeam::queue::SegQueue::new();
+        let mut available_enclave_threads = FnvHashMap::default();
 
         for thread in threads_vector {
-            threads_queue.push(Self::event_queue_add_tcs(&mut event_queues, thread));
+            available_enclave_threads.insert(thread.address(), Self::event_queue_add_tcs(&mut event_queues, thread));
         }
 
         Arc::new(EnclaveState {
@@ -741,7 +742,7 @@ impl EnclaveState {
             last_fd,
             exiting: AtomicBool::new(false),
             usercall_ext,
-            threads_queue,
+            available_enclave_threads: Mutex::new(available_enclave_threads),
             forward_panics,
             fifo_guards: Mutex::new(None),
             return_queue_tx: Mutex::new(None),
@@ -913,7 +914,9 @@ impl EnclaveState {
                         let fut = async move {
                             let ret = match state.mode {
                                 EnclaveEntry::Library => {
-                                    enclave_clone.threads_queue.push(StoppedTcs { tcs });
+                                    enclave_clone.available_enclave_threads.lock().await.insert(tcs.address(), StoppedTcs {
+                                        tcs,
+                                    });
                                     Ok((v1, v2))
                                 }
                                 EnclaveEntry::ExecutableMain => Err(EnclaveAbort::MainReturned),
@@ -926,7 +929,9 @@ impl EnclaveState {
                                     // If the enclave is in the exit-state, threads are no
                                     // longer able to be launched
                                     if !enclave_clone.exiting.load(Ordering::SeqCst) {
-                                        enclave_clone.threads_queue.push(StoppedTcs { tcs });
+                                        enclave_clone.available_enclave_threads.lock().await.insert(tcs.address(), StoppedTcs {
+                                            tcs,
+                                        });
                                     }
                                     Ok((0, 0))
                                 }
@@ -1054,8 +1059,7 @@ impl EnclaveState {
 
         rt.block_on(async move {
             enclave.abort_all_threads();
-            //clear the threads_queue
-            while enclave.threads_queue.pop().is_ok() {}
+            enclave.available_enclave_threads.lock().await.clear();
 
             let cmd = enclave.kind.as_command().unwrap();
             let mut cmddata = cmd.panic_reason.lock().await;
@@ -1104,7 +1108,17 @@ impl EnclaveState {
         p4: u64,
         p5: u64,
     ) -> StdResult<(u64, u64), failure::Error> {
-        let thread = enclave.threads_queue.pop().expect("threads queue empty");
+        let mut rt = tokio::runtime::Builder::new()
+            .basic_scheduler()
+            .enable_all()
+            .build()
+            .expect("failed to create tokio Runtime");
+
+        let thread = rt.block_on(async {
+            let mut available_enclave_threads = enclave.available_enclave_threads.lock().await;
+            let k = available_enclave_threads.keys().next()?.to_owned();
+            available_enclave_threads.remove(&k)
+        }).expect("out of enclave threads");
         let work = Work {
             tcs: RunningTcs {
                 tcs_address: thread.tcs.address(),
@@ -1438,18 +1452,45 @@ impl<'tcs> IOHandlerInput<'tcs> {
     }
 
     #[inline(always)]
-    fn launch_thread(&self) -> IoResult<()> {
+    async fn launch_thread(&self, tcs_address: Option<Tcs>) -> IoResult<()> {
+        async fn find_tcs(handler: &IOHandlerInput<'_>, tcs_address: &Option<TcsAddress>) -> IoResult<Option<StoppedTcs>> {
+            let mut guard = handler.enclave.available_enclave_threads.lock().await;
+            if let Some(tcs_address) = tcs_address {
+                Ok(guard.remove(&tcs_address))
+            } else {
+                // Pick any TCS available
+                let k = guard.keys().next().ok_or::<std::io::Error>(IoErrorKind::WouldBlock.into())?.to_owned();
+                Ok(guard.remove(&k))
+            }
+        }
+
+        fn select_tcs(handler: &IOHandlerInput, tcs_address: &Option<TcsAddress>) -> IoResult<StoppedTcs> {
+            executor::block_on(async {
+                loop {
+                    match find_tcs(handler, tcs_address).await? {
+                        Some(tcs) => break Ok(tcs),
+                        None => {
+                            // Release lock and try again. The enclave is in charge of its own TCS
+                            // structs. Unfortunately, there is a small issue recording terminated
+                            // TCSs; when a thread has finished with the task it was assigned, it
+                            // marks its own TCS as available for new threads, while in fact it is
+                            // still executing (see `Task::run()` in `std/src/sys/sgx/thread.rs`).
+                            // When that TCS is subsequently selected to run a new thread, it may
+                            // still not have terminated yet and thus may not yet be present in this
+                            // `available_enclave_threads`. We need to wait for it to become ready.
+                        }
+                    }
+                }
+            })
+        }
+
         // check if enclave is of type command
         self.enclave
             .kind
             .as_command()
             .ok_or(IoErrorKind::InvalidInput)?;
-        let new_tcs = match self.enclave.threads_queue.pop() {
-            Ok(tcs) => tcs,
-            Err(_) => {
-                return Err(IoErrorKind::WouldBlock.into());
-            }
-        };
+        let tcs_address = tcs_address.map(|addr| TcsAddress(addr.as_ptr() as _));
+        let new_tcs = select_tcs(self, &tcs_address)?;
 
         let ret = self.work_sender.send(Work {
             tcs: RunningTcs {
@@ -1464,7 +1505,8 @@ impl<'tcs> IOHandlerInput<'tcs> {
                 let entry = e.0.entry;
                 match entry {
                     CoEntry::Initial(tcs, _, _ ,_, _, _) => {
-                        self.enclave.threads_queue.push(StoppedTcs { tcs });
+                        self.enclave.available_enclave_threads.lock().await.insert(tcs.address(),
+                                                                                   StoppedTcs { tcs });
                     },
                     _ => unreachable!(),
                 };
